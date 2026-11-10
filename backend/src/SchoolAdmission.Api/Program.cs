@@ -67,6 +67,26 @@ app.UseCors("AllowAll");
 
 app.MapControllers();
 
+// Root status endpoint for user convenience
+app.MapGet("/", () => Results.Ok(new
+{
+    service = "School Admission System API",
+    status = "Running",
+    version = "1.0",
+    frontendUrl = "http://localhost:3000",
+    availableEndpoints = new[]
+    {
+        "GET /classes",
+        "POST /classes",
+        "GET /classes/{classId}",
+        "POST /classes/{classId}/holds",
+        "GET /holds/{holdId}",
+        "POST /holds/{holdId}/confirm",
+        "DELETE /holds/{holdId}",
+        "GET /me/holds"
+    }
+}));
+
 // Apply Code-First Migrations automatically on startup if using a relational database
 using (var scope = app.Services.CreateScope())
 {
