@@ -35,7 +35,7 @@ public class AdmissionService : IAdmissionService
         {
             return seconds;
         }
-        return 600; // default 10 minutes (600 seconds)
+        return 120; // default 2 minutes (120 seconds) as per specification
     }
 
     public async Task<CreateClassResponse> CreateClassAsync(CreateClassRequest request)

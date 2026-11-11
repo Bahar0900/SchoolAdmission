@@ -62,7 +62,7 @@ dotnet test backend/SchoolAdmission.sln
 | ভ্যারিয়েবল | ডিফল্ট মান | বিবরণ |
 |---|---|---|
 | `DATABASE_URL` | `Host=db;Port=5432;Database=school_admission;...` | PostgreSQL ডাটাবেস কানেকশন স্ট্রিং |
-| `HOLD_DURATION_SECONDS` | `600` (১০ মিনিট) | আসন সাময়িক সংরক্ষণের সময়কাল (সেকেন্ডে) |
+| `HOLD_DURATION_SECONDS` | `120` (২ মিনিট) | আসন সাময়িক সংরক্ষণের সময়কাল (সেকেন্ডে) |
 | `PORT` | `8080` | ব্যাকএন্ড সার্ভারের পোর্ট |
 | `VITE_API_BASE_URL` | `http://localhost:8080` | ফ্রন্টএন্ড থেকে ব্যাকএন্ড এপিআই এর URL |
 
