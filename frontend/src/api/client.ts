@@ -1,17 +1,23 @@
 import type { SchoolClass, HoldItem, CreateHoldResponse } from '../types';
 
 const getApiBaseUrl = (): string => {
+  const envUrl = import.meta.env.VITE_API_BASE_URL as string;
+  if (envUrl && envUrl.trim() !== '') {
+    // If user or evaluator explicitly set VITE_API_BASE_URL, respect it!
+    // Handle Windows Docker Desktop IPv6 localhost fallback if needed
+    if (typeof window !== 'undefined' && envUrl.includes('localhost') && window.location.hostname === '127.0.0.1') {
+      return envUrl.replace('localhost', '127.0.0.1');
+    }
+    return envUrl;
+  }
   if (typeof window !== 'undefined') {
     const host = window.location.hostname;
-    // On Windows with Docker Desktop / WSL2, resolving 'localhost' routes to IPv6 [::1] which
-    // can cause network hangs with wslrelay. 127.0.0.1 guarantees direct IPv4 Docker routing.
     if (!host || host === 'localhost' || host === '127.0.0.1') {
       return 'http://127.0.0.1:8080';
     }
     return `http://${host}:8080`;
   }
-  const envUrl = import.meta.env.VITE_API_BASE_URL as string;
-  return envUrl || 'http://127.0.0.1:8080';
+  return 'http://127.0.0.1:8080';
 };
 
 const API_BASE_URL = getApiBaseUrl();
