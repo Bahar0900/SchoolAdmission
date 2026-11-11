@@ -1,6 +1,20 @@
 import type { SchoolClass, HoldItem, CreateHoldResponse } from '../types';
 
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL as string) || 'http://localhost:8080';
+const getApiBaseUrl = (): string => {
+  if (typeof window !== 'undefined') {
+    const host = window.location.hostname;
+    // On Windows with Docker Desktop / WSL2, resolving 'localhost' routes to IPv6 [::1] which
+    // can cause network hangs with wslrelay. 127.0.0.1 guarantees direct IPv4 Docker routing.
+    if (!host || host === 'localhost' || host === '127.0.0.1') {
+      return 'http://127.0.0.1:8080';
+    }
+    return `http://${host}:8080`;
+  }
+  const envUrl = import.meta.env.VITE_API_BASE_URL as string;
+  return envUrl || 'http://127.0.0.1:8080';
+};
+
+const API_BASE_URL = getApiBaseUrl();
 
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
