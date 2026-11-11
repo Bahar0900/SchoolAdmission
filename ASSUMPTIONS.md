@@ -32,12 +32,15 @@ This document outlines the architectural assumptions and design decisions made w
 
 ---
 
-### 4. Scope of the "One Active Hold / Admission" Rule
+### 4. Scope of the "One Active Hold / Admission" Rule & Real-World Admission Integrity
 * **Specification:** *"একজন শিক্ষার্থী একটা class-এ একই সময়ে একটার বেশি active আবেদন বা নিশ্চিত ভর্তি রাখতে পারবে না।"*
-* **Assumption:**
-  * The restriction applies per class: a student cannot hold multiple active holds or confirmed admissions for the *same* class.
-  * If a student already has a `CONFIRMED` admission or an unexpired `HELD` reservation in a given class, any new hold attempt for that class is rejected with `409 Conflict`.
-  * If an earlier hold in that class has `EXPIRED` or was `CANCELLED`, the student is permitted to apply again.
+* **Detailed Architectural Decision & Logic:**
+  * **Per-Class Constraint:** A student cannot have more than one active hold or confirmed admission in the **same class** at the same time.
+  * **Multi-Class Hold (Exploration Phase):** During the initial application window, parents often apply (HOLD) for multiple shifts (e.g., "Class 6 - Morning Shift" and "Class 6 - Day Shift") to maximize their chances of securing a seat. The system permits temporary holds across different classes.
+  * **Single-Seat Final Admission (Confirmation Phase):** In real life, a student can only attend **one** class/shift. Allowing a student to confirm and pay for multiple classes simultaneously wastes limited seats and deprives other children of admission. Therefore:
+    1. Once a student **confirms** admission in ANY class, they cannot confirm or apply for any additional class.
+    2. Any existing `HELD` seats the student had in other classes are **automatically cancelled and released**, immediately returning those seats to the available pool for other parents!
+    3. Any subsequent attempt to hold a seat while holding a `CONFIRMED` admission is rejected with `409 Conflict`.
 
 ---
 

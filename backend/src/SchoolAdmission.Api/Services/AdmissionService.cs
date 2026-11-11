@@ -160,7 +160,17 @@ public class AdmissionService : IAdmissionService
                     throw new NotFoundException($"Class with ID '{classId}' not found.");
                 }
 
-                // 2. Rule 3: A student cannot have more than one active hold or confirmed admission in the same class
+                // 2. System-wide rule: If student already has a CONFIRMED admission in any class, they cannot apply for any other class
+                var hasAnyConfirmed = await _dbContext.Holds
+                    .AnyAsync(h => h.StudentId == studentId && h.Status == HoldStatus.CONFIRMED);
+
+                if (hasAnyConfirmed)
+                {
+                    if (transaction != null) await transaction.RollbackAsync();
+                    throw new ConflictException("You already have a confirmed admission in a class. Cannot apply for additional classes.");
+                }
+
+                // Rule 3: A student cannot have more than one active hold or confirmed admission in the same class
                 var existingActive = await _dbContext.Holds
                     .AnyAsync(h => h.ClassId == classId &&
                                    h.StudentId == studentId &&
@@ -312,6 +322,16 @@ public class AdmissionService : IAdmissionService
                     return new ConfirmHoldResponse(hold.Id, HoldStatus.CONFIRMED.ToString());
                 }
 
+                // Check if student already has another CONFIRMED admission in any other class
+                var hasOtherConfirmed = await _dbContext.Holds
+                    .AnyAsync(h => h.StudentId == studentId && h.Id != holdId && h.Status == HoldStatus.CONFIRMED);
+
+                if (hasOtherConfirmed)
+                {
+                    if (transaction != null) await transaction.RollbackAsync();
+                    throw new ConflictException("You already have a confirmed admission in another class. Cannot confirm multiple classes.");
+                }
+
                 // Rule 4: Only unexpired HELD holds can be confirmed
                 if (hold.Status == HoldStatus.EXPIRED || (hold.Status == HoldStatus.HELD && hold.ExpiresAt <= now))
                 {
@@ -329,6 +349,16 @@ public class AdmissionService : IAdmissionService
 
                 hold.Status = HoldStatus.CONFIRMED;
                 hold.ConfirmedAt = now;
+
+                // Once confirmed, automatically release/cancel any other active holds of this student in other classes
+                var otherActiveHolds = await _dbContext.Holds
+                    .Where(h => h.StudentId == studentId && h.Id != holdId && h.Status == HoldStatus.HELD)
+                    .ToListAsync();
+
+                foreach (var otherHold in otherActiveHolds)
+                {
+                    otherHold.Status = HoldStatus.CANCELLED;
+                }
 
                 await _dbContext.SaveChangesAsync();
                 if (transaction != null) await transaction.CommitAsync();

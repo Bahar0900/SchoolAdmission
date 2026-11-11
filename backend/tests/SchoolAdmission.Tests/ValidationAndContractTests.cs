@@ -111,4 +111,55 @@ public class ValidationAndContractTests : IClassFixture<TestWebApplicationFactor
         Assert.Equal(0, classDetail.HeldSeats);
         Assert.Equal(9, classDetail.AvailableSeats);
     }
+
+    [Fact]
+    public async Task ConfirmAdmission_InOneClass_CancelsOtherHolds_AndPreventsFurtherAdmissions()
+    {
+        var student = "20152691234567899";
+
+        // 1. Create Class A and Class B
+        var classARes = await _client.PostAsJsonAsync("/classes", new CreateClassRequest("Class A - Morning", 5));
+        var classAData = await classARes.Content.ReadFromJsonAsync<CreateClassResponse>();
+
+        var classBRes = await _client.PostAsJsonAsync("/classes", new CreateClassRequest("Class B - Day", 5));
+        var classBData = await classBRes.Content.ReadFromJsonAsync<CreateClassResponse>();
+
+        // 2. Student holds a seat in Class A and a seat in Class B
+        var holdAReq = new HttpRequestMessage(HttpMethod.Post, $"/classes/{classAData!.Id}/holds");
+        holdAReq.Headers.Add("X-Student-Id", student);
+        var holdARes = await _client.SendAsync(holdAReq);
+        var holdAData = await holdARes.Content.ReadFromJsonAsync<CreateHoldResponse>();
+
+        var holdBReq = new HttpRequestMessage(HttpMethod.Post, $"/classes/{classBData!.Id}/holds");
+        holdBReq.Headers.Add("X-Student-Id", student);
+        var holdBRes = await _client.SendAsync(holdBReq);
+        var holdBData = await holdBRes.Content.ReadFromJsonAsync<CreateHoldResponse>();
+
+        // 3. Confirm hold in Class A
+        var confirmAReq = new HttpRequestMessage(HttpMethod.Post, $"/holds/{holdAData!.HoldId}/confirm");
+        confirmAReq.Headers.Add("X-Student-Id", student);
+        var confirmARes = await _client.SendAsync(confirmAReq);
+        Assert.Equal(HttpStatusCode.OK, confirmARes.StatusCode);
+
+        // 4. Verify Class B's hold was automatically cancelled and its seat released
+        var holdBStatus = await _client.GetFromJsonAsync<HoldStatusResponse>($"/holds/{holdBData!.HoldId}");
+        Assert.Equal("CANCELLED", holdBStatus!.Status);
+
+        var classBDetail = await _client.GetFromJsonAsync<ClassDetailResponse>($"/classes/{classBData.Id}");
+        Assert.Equal(0, classBDetail!.HeldSeats);
+        Assert.Equal(0, classBDetail.ConfirmedSeats);
+        Assert.Equal(5, classBDetail.AvailableSeats); // seat was released back!
+
+        // 5. Attempting to confirm hold B now must fail
+        var confirmBReq = new HttpRequestMessage(HttpMethod.Post, $"/holds/{holdBData.HoldId}/confirm");
+        confirmBReq.Headers.Add("X-Student-Id", student);
+        var confirmBRes = await _client.SendAsync(confirmBReq);
+        Assert.True(confirmBRes.StatusCode == HttpStatusCode.BadRequest || confirmBRes.StatusCode == HttpStatusCode.Conflict);
+
+        // 6. Attempting to create a new hold in any other class must fail with 409 Conflict
+        var newHoldReq = new HttpRequestMessage(HttpMethod.Post, $"/classes/{classBData.Id}/holds");
+        newHoldReq.Headers.Add("X-Student-Id", student);
+        var newHoldRes = await _client.SendAsync(newHoldReq);
+        Assert.Equal(HttpStatusCode.Conflict, newHoldRes.StatusCode);
+    }
 }
