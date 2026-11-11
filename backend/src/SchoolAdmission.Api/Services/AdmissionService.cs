@@ -40,11 +40,21 @@ public class AdmissionService : IAdmissionService
 
     public async Task<CreateClassResponse> CreateClassAsync(CreateClassRequest request)
     {
+        var normalizedName = request.Name.Trim();
+        var existingClass = await _dbContext.Classes
+            .FirstOrDefaultAsync(c => c.Name.ToLower() == normalizedName.ToLower());
+
+        if (existingClass != null)
+        {
+            _logger.LogInformation("Class with name '{Name}' already exists with ID {Id}. Skipping duplicate creation.", existingClass.Name, existingClass.Id);
+            return new CreateClassResponse(existingClass.Id, existingClass.Name, existingClass.TotalSeats);
+        }
+
         var id = "c_" + Guid.NewGuid().ToString("N")[..8];
         var schoolClass = new SchoolClass
         {
             Id = id,
-            Name = request.Name.Trim(),
+            Name = normalizedName,
             TotalSeats = request.TotalSeats,
             CreatedAt = DateTime.UtcNow
         };
@@ -63,29 +73,38 @@ public class AdmissionService : IAdmissionService
             .AsNoTracking()
             .ToListAsync();
 
-        var result = new List<ClassDetailResponse>();
+        // Optimized single aggregation query for all active holds
+        var stats = await _dbContext.Holds
+            .Where(h => h.Status == HoldStatus.CONFIRMED || (h.Status == HoldStatus.HELD && h.ExpiresAt > now))
+            .GroupBy(h => new { h.ClassId, h.Status })
+            .Select(g => new { g.Key.ClassId, g.Key.Status, Count = g.Count() })
+            .ToListAsync();
 
-        foreach (var c in classes)
+        var statsMap = stats
+            .GroupBy(s => s.ClassId)
+            .ToDictionary(
+                g => g.Key,
+                g => new
+                {
+                    Confirmed = g.FirstOrDefault(x => x.Status == HoldStatus.CONFIRMED)?.Count ?? 0,
+                    Held = g.FirstOrDefault(x => x.Status == HoldStatus.HELD)?.Count ?? 0
+                });
+
+        return classes.Select(c =>
         {
-            var confirmedSeats = await _dbContext.Holds
-                .CountAsync(h => h.ClassId == c.Id && h.Status == HoldStatus.CONFIRMED);
+            var confirmed = statsMap.TryGetValue(c.Id, out var s) ? s.Confirmed : 0;
+            var held = statsMap.TryGetValue(c.Id, out var s2) ? s2.Held : 0;
+            var available = Math.Max(0, c.TotalSeats - (confirmed + held));
 
-            var heldSeats = await _dbContext.Holds
-                .CountAsync(h => h.ClassId == c.Id && h.Status == HoldStatus.HELD && h.ExpiresAt > now);
-
-            var availableSeats = Math.Max(0, c.TotalSeats - (confirmedSeats + heldSeats));
-
-            result.Add(new ClassDetailResponse(
+            return new ClassDetailResponse(
                 c.Id,
                 c.Name,
                 c.TotalSeats,
-                heldSeats,
-                confirmedSeats,
-                availableSeats
-            ));
-        }
-
-        return result;
+                held,
+                confirmed,
+                available
+            );
+        });
     }
 
     public async Task<ClassDetailResponse> GetClassByIdAsync(string classId)
@@ -130,111 +149,92 @@ public class AdmissionService : IAdmissionService
 
         try
         {
-            Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction? transaction = null;
+            await using var transaction = isPostgres ? await _dbContext.Database.BeginTransactionAsync() : null;
+
+            var now = DateTime.UtcNow;
+            var holdDuration = GetHoldDurationSeconds();
+
+            // 1. Pessimistic lock row in PostgreSQL or query entity in-memory
+            SchoolClass? schoolClass;
             if (isPostgres)
             {
-                transaction = await _dbContext.Database.BeginTransactionAsync();
+                schoolClass = await _dbContext.Classes
+                    .FromSqlInterpolated($"SELECT * FROM classes WHERE id = {classId} FOR UPDATE")
+                    .FirstOrDefaultAsync();
             }
-
-            try
+            else
             {
-                var now = DateTime.UtcNow;
-                var holdDuration = GetHoldDurationSeconds();
-
-                // 1. Pessimistic lock row in PostgreSQL or query entity in-memory
-                SchoolClass? schoolClass;
-                if (isPostgres)
-                {
-                    schoolClass = await _dbContext.Classes
-                        .FromSqlInterpolated($"SELECT * FROM classes WHERE id = {classId} FOR UPDATE")
-                        .FirstOrDefaultAsync();
-                }
-                else
-                {
-                    schoolClass = await _dbContext.Classes.FirstOrDefaultAsync(c => c.Id == classId);
-                }
-
-                if (schoolClass == null)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    throw new NotFoundException($"Class with ID '{classId}' not found.");
-                }
-
-                // 2. System-wide rule: If student already has a CONFIRMED admission in any class, they cannot apply for any other class
-                var hasAnyConfirmed = await _dbContext.Holds
-                    .AnyAsync(h => h.StudentId == studentId && h.Status == HoldStatus.CONFIRMED);
-
-                if (hasAnyConfirmed)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    throw new ConflictException("You already have a confirmed admission in a class. Cannot apply for additional classes.");
-                }
-
-                // Rule 3: A student cannot have more than one active hold or confirmed admission in the same class
-                var existingActive = await _dbContext.Holds
-                    .AnyAsync(h => h.ClassId == classId &&
-                                   h.StudentId == studentId &&
-                                   (h.Status == HoldStatus.CONFIRMED || (h.Status == HoldStatus.HELD && h.ExpiresAt > now)));
-
-                if (existingActive)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    throw new ConflictException("You already have an active hold or confirmed admission in this class.");
-                }
-
-                // 3. Rule 1: Under no circumstance can held + confirmed exceed totalSeats
-                var confirmedSeats = await _dbContext.Holds
-                    .CountAsync(h => h.ClassId == classId && h.Status == HoldStatus.CONFIRMED);
-
-                var heldSeats = await _dbContext.Holds
-                    .CountAsync(h => h.ClassId == classId && h.Status == HoldStatus.HELD && h.ExpiresAt > now);
-
-                var availableSeats = schoolClass.TotalSeats - (confirmedSeats + heldSeats);
-
-                if (availableSeats <= 0)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    throw new ConflictException("No seats available in this class.");
-                }
-
-                // 4. Create new hold
-                var holdId = "h_" + Guid.NewGuid().ToString("N")[..8];
-                var expiresAt = now.AddSeconds(holdDuration);
-
-                var newHold = new SeatHold
-                {
-                    Id = holdId,
-                    ClassId = classId,
-                    StudentId = studentId,
-                    Status = HoldStatus.HELD,
-                    ExpiresAt = expiresAt,
-                    CreatedAt = now
-                };
-
-                _dbContext.Holds.Add(newHold);
-                await _dbContext.SaveChangesAsync();
-
-                if (transaction != null)
-                {
-                    await transaction.CommitAsync();
-                }
-
-                return new CreateHoldResponse(
-                    newHold.Id,
-                    newHold.ClassId,
-                    newHold.StudentId,
-                    newHold.Status.ToString(),
-                    newHold.ExpiresAt.ToString("yyyy-MM-ddTHH:mm:ssZ")
-                );
+                schoolClass = await _dbContext.Classes.FirstOrDefaultAsync(c => c.Id == classId);
             }
-            catch
+
+            if (schoolClass == null)
             {
-                if (transaction != null)
-                {
-                    await transaction.RollbackAsync();
-                }
-                throw;
+                throw new NotFoundException($"Class with ID '{classId}' not found.");
             }
+
+            // 2. System-wide rule: If student already has a CONFIRMED admission in any class, they cannot apply for any other class
+            var hasAnyConfirmed = await _dbContext.Holds
+                .AnyAsync(h => h.StudentId == studentId && h.Status == HoldStatus.CONFIRMED);
+
+            if (hasAnyConfirmed)
+            {
+                throw new ConflictException("You already have a confirmed admission in a class. Cannot apply for additional classes.");
+            }
+
+            // Rule 3: A student cannot have more than one active hold or confirmed admission in the same class
+            var existingActive = await _dbContext.Holds
+                .AnyAsync(h => h.ClassId == classId &&
+                               h.StudentId == studentId &&
+                               (h.Status == HoldStatus.CONFIRMED || (h.Status == HoldStatus.HELD && h.ExpiresAt > now)));
+
+            if (existingActive)
+            {
+                throw new ConflictException("You already have an active hold or confirmed admission in this class.");
+            }
+
+            // 3. Rule 1: Under no circumstance can held + confirmed exceed totalSeats
+            var confirmedSeats = await _dbContext.Holds
+                .CountAsync(h => h.ClassId == classId && h.Status == HoldStatus.CONFIRMED);
+
+            var heldSeats = await _dbContext.Holds
+                .CountAsync(h => h.ClassId == classId && h.Status == HoldStatus.HELD && h.ExpiresAt > now);
+
+            var availableSeats = schoolClass.TotalSeats - (confirmedSeats + heldSeats);
+
+            if (availableSeats <= 0)
+            {
+                throw new ConflictException("No seats available in this class.");
+            }
+
+            // 4. Create new hold
+            var holdId = "h_" + Guid.NewGuid().ToString("N")[..8];
+            var expiresAt = now.AddSeconds(holdDuration);
+
+            var newHold = new SeatHold
+            {
+                Id = holdId,
+                ClassId = classId,
+                StudentId = studentId,
+                Status = HoldStatus.HELD,
+                ExpiresAt = expiresAt,
+                CreatedAt = now
+            };
+
+            _dbContext.Holds.Add(newHold);
+            await _dbContext.SaveChangesAsync();
+
+            if (transaction != null)
+            {
+                await transaction.CommitAsync();
+            }
+
+            return new CreateHoldResponse(
+                newHold.Id,
+                newHold.ClassId,
+                newHold.StudentId,
+                newHold.Status.ToString(),
+                newHold.ExpiresAt.ToString("yyyy-MM-ddTHH:mm:ssZ")
+            );
         }
         finally
         {
@@ -280,99 +280,79 @@ public class AdmissionService : IAdmissionService
 
         try
         {
-            Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction? transaction = null;
+            await using var transaction = isPostgres ? await _dbContext.Database.BeginTransactionAsync() : null;
+
+            var now = DateTime.UtcNow;
+
+            SeatHold? hold;
             if (isPostgres)
             {
-                transaction = await _dbContext.Database.BeginTransactionAsync();
+                hold = await _dbContext.Holds
+                    .FromSqlInterpolated($"SELECT * FROM holds WHERE id = {holdId} FOR UPDATE")
+                    .FirstOrDefaultAsync();
+            }
+            else
+            {
+                hold = await _dbContext.Holds.FirstOrDefaultAsync(h => h.Id == holdId);
             }
 
-            try
+            if (hold == null)
             {
-                var now = DateTime.UtcNow;
+                throw new NotFoundException($"Hold with ID '{holdId}' not found.");
+            }
 
-                SeatHold? hold;
-                if (isPostgres)
-                {
-                    hold = await _dbContext.Holds
-                        .FromSqlInterpolated($"SELECT * FROM holds WHERE id = {holdId} FOR UPDATE")
-                        .FirstOrDefaultAsync();
-                }
-                else
-                {
-                    hold = await _dbContext.Holds.FirstOrDefaultAsync(h => h.Id == holdId);
-                }
+            // Rule 4: Only the student themselves can confirm their own hold
+            if (hold.StudentId != studentId)
+            {
+                throw new ForbiddenException("You can only confirm your own hold.");
+            }
 
-                if (hold == null)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    throw new NotFoundException($"Hold with ID '{holdId}' not found.");
-                }
-
-                // Rule 4: Only the student themselves can confirm their own hold
-                if (hold.StudentId != studentId)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    throw new ForbiddenException("You can only confirm your own hold.");
-                }
-
-                // Rule 5: Idempotency - If confirm is called multiple times, confirmedSeats only increases once
-                if (hold.Status == HoldStatus.CONFIRMED)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    return new ConfirmHoldResponse(hold.Id, HoldStatus.CONFIRMED.ToString());
-                }
-
-                // Check if student already has another CONFIRMED admission in any other class
-                var hasOtherConfirmed = await _dbContext.Holds
-                    .AnyAsync(h => h.StudentId == studentId && h.Id != holdId && h.Status == HoldStatus.CONFIRMED);
-
-                if (hasOtherConfirmed)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    throw new ConflictException("You already have a confirmed admission in another class. Cannot confirm multiple classes.");
-                }
-
-                // Rule 4: Only unexpired HELD holds can be confirmed
-                if (hold.Status == HoldStatus.EXPIRED || (hold.Status == HoldStatus.HELD && hold.ExpiresAt <= now))
-                {
-                    hold.Status = HoldStatus.EXPIRED;
-                    await _dbContext.SaveChangesAsync();
-                    if (transaction != null) await transaction.CommitAsync();
-                    throw new BadRequestException("Hold has expired and cannot be confirmed.");
-                }
-
-                if (hold.Status == HoldStatus.CANCELLED)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    throw new BadRequestException("Cancelled hold cannot be confirmed.");
-                }
-
-                hold.Status = HoldStatus.CONFIRMED;
-                hold.ConfirmedAt = now;
-
-                // Once confirmed, automatically release/cancel any other active holds of this student in other classes
-                var otherActiveHolds = await _dbContext.Holds
-                    .Where(h => h.StudentId == studentId && h.Id != holdId && h.Status == HoldStatus.HELD)
-                    .ToListAsync();
-
-                foreach (var otherHold in otherActiveHolds)
-                {
-                    otherHold.Status = HoldStatus.CANCELLED;
-                }
-
-                await _dbContext.SaveChangesAsync();
-                if (transaction != null) await transaction.CommitAsync();
-
+            // Rule 5: Idempotency - If confirm is called multiple times, confirmedSeats only increases once
+            if (hold.Status == HoldStatus.CONFIRMED)
+            {
                 return new ConfirmHoldResponse(hold.Id, HoldStatus.CONFIRMED.ToString());
             }
-            catch
+
+            // Check if student already has another CONFIRMED admission in any other class
+            var hasOtherConfirmed = await _dbContext.Holds
+                .AnyAsync(h => h.StudentId == studentId && h.Id != holdId && h.Status == HoldStatus.CONFIRMED);
+
+            if (hasOtherConfirmed)
             {
-                if (transaction != null)
-                {
-                    await transaction.RollbackAsync();
-                }
-                throw;
+                throw new ConflictException("You already have a confirmed admission in another class. Cannot confirm multiple classes.");
             }
+
+            // Rule 4: Only unexpired HELD holds can be confirmed
+            if (hold.Status == HoldStatus.EXPIRED || (hold.Status == HoldStatus.HELD && hold.ExpiresAt <= now))
+            {
+                hold.Status = HoldStatus.EXPIRED;
+                await _dbContext.SaveChangesAsync();
+                if (transaction != null) await transaction.CommitAsync();
+                throw new BadRequestException("Hold has expired and cannot be confirmed.");
+            }
+
+            if (hold.Status == HoldStatus.CANCELLED)
+            {
+                throw new BadRequestException("Cancelled hold cannot be confirmed.");
+            }
+
+            hold.Status = HoldStatus.CONFIRMED;
+            hold.ConfirmedAt = now;
+
+            // Once confirmed, automatically release/cancel any other active holds of this student in other classes
+            var otherActiveHolds = await _dbContext.Holds
+                .Where(h => h.StudentId == studentId && h.Id != holdId && h.Status == HoldStatus.HELD)
+                .ToListAsync();
+
+            foreach (var otherHold in otherActiveHolds)
+            {
+                otherHold.Status = HoldStatus.CANCELLED;
+            }
+
+            await _dbContext.SaveChangesAsync();
+            if (transaction != null) await transaction.CommitAsync();
+
+            return new ConfirmHoldResponse(hold.Id, HoldStatus.CONFIRMED.ToString());
         }
         finally
         {
@@ -392,62 +372,43 @@ public class AdmissionService : IAdmissionService
 
         try
         {
-            Microsoft.EntityFrameworkCore.Storage.IDbContextTransaction? transaction = null;
+            await using var transaction = isPostgres ? await _dbContext.Database.BeginTransactionAsync() : null;
+
+            SeatHold? hold;
             if (isPostgres)
             {
-                transaction = await _dbContext.Database.BeginTransactionAsync();
+                hold = await _dbContext.Holds
+                    .FromSqlInterpolated($"SELECT * FROM holds WHERE id = {holdId} FOR UPDATE")
+                    .FirstOrDefaultAsync();
             }
-
-            try
+            else
             {
-                SeatHold? hold;
-                if (isPostgres)
-                {
-                    hold = await _dbContext.Holds
-                        .FromSqlInterpolated($"SELECT * FROM holds WHERE id = {holdId} FOR UPDATE")
-                        .FirstOrDefaultAsync();
-                }
-                else
-                {
-                    hold = await _dbContext.Holds.FirstOrDefaultAsync(h => h.Id == holdId);
-                }
-
-                if (hold == null)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    throw new NotFoundException($"Hold with ID '{holdId}' not found.");
-                }
-
-                if (hold.StudentId != studentId)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    throw new ForbiddenException("You can only cancel your own hold.");
-                }
-
-                if (hold.Status == HoldStatus.CONFIRMED)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    throw new BadRequestException("Confirmed admissions cannot be cancelled.");
-                }
-
-                if (hold.Status == HoldStatus.CANCELLED)
-                {
-                    if (transaction != null) await transaction.RollbackAsync();
-                    return;
-                }
-
-                hold.Status = HoldStatus.CANCELLED;
-                await _dbContext.SaveChangesAsync();
-                if (transaction != null) await transaction.CommitAsync();
+                hold = await _dbContext.Holds.FirstOrDefaultAsync(h => h.Id == holdId);
             }
-            catch
+
+            if (hold == null)
             {
-                if (transaction != null)
-                {
-                    await transaction.RollbackAsync();
-                }
-                throw;
+                throw new NotFoundException($"Hold with ID '{holdId}' not found.");
             }
+
+            if (hold.StudentId != studentId)
+            {
+                throw new ForbiddenException("You can only cancel your own hold.");
+            }
+
+            if (hold.Status == HoldStatus.CONFIRMED)
+            {
+                throw new BadRequestException("Confirmed admissions cannot be cancelled.");
+            }
+
+            if (hold.Status == HoldStatus.CANCELLED)
+            {
+                return;
+            }
+
+            hold.Status = HoldStatus.CANCELLED;
+            await _dbContext.SaveChangesAsync();
+            if (transaction != null) await transaction.CommitAsync();
         }
         finally
         {

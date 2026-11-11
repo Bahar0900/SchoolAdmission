@@ -38,9 +38,17 @@ if (connectionString.StartsWith("postgres://") || connectionString.StartsWith("p
     connectionString = $"Host={host};Port={dbPort};Database={database};Username={user};Password={password}";
 }
 
+if (!connectionString.Contains("Maximum Pool Size", StringComparison.OrdinalIgnoreCase))
+{
+    connectionString += ";Pooling=true;Maximum Pool Size=80;Timeout=45;";
+}
+
 builder.Services.AddDbContext<ApplicationDbContext>(options =>
 {
-    options.UseNpgsql(connectionString);
+    options.UseNpgsql(connectionString, npgsqlOptions =>
+    {
+        npgsqlOptions.CommandTimeout(60);
+    });
 });
 
 // Register Application Services
