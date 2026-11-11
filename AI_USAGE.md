@@ -5,7 +5,7 @@ This document details the usage of Artificial Intelligence tools during the deve
 ---
 
 ## 1. AI Tool Used
-* **Primary Tool:** Google Antigravity / Gemini 3.8 Flash
+* **Primary Tool:** Gemini 3.8 Flash
 * **Role of AI:** Pair-programming assistant, initial code scaffolding, boilerplate generation, and syntax assistance for .NET 8 Web API, Entity Framework Core, React 18 TypeScript components, and Docker Compose configurations.
 
 ---
